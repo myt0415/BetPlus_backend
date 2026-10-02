@@ -7,6 +7,7 @@ from app.core.config import get_settings
 from app.db.session import get_db
 from app.schemas import PaymentInitiateIn, PaymentIntentOut, PaymentOtpIn
 from app.services.idempotency_service import IdempotencyService
+from app.services.nowpayments_service import verify_ipn_signature
 from app.services.payment_service import PaymentError, PaymentService
 from app.services.rate_limit import enforce_rate_limit
 
@@ -20,6 +21,9 @@ def _intent_out(intent) -> PaymentIntentOut:
         update={
             "otp_required": otp_required,
             "next_action": "otp" if otp_required else None,
+            "transaction_id": intent.id,
+            "payment_id": intent.provider_txn_id,
+            "review_required": bool(extra.get("reconciliation_required")),
         }
     )
 
@@ -29,6 +33,37 @@ def _payment_error_detail(exc: PaymentError) -> dict[str, str]:
     if exc.reference:
         detail["reference"] = exc.reference
     return detail
+
+
+@router.post("/webhooks/nowpayments")
+async def nowpayments_webhook(request: Request, db: Session = Depends(get_db)):
+    """NOWPayments IPN. Signature is checked before any wallet credit."""
+    enforce_rate_limit(bucket="nowpayments-ipn", limit=120, window_seconds=60)
+    raw = await request.body()
+    signature = request.headers.get("x-nowpayments-sig")
+    if not verify_ipn_signature(raw, signature):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    try:
+        intent = PaymentService.handle_nowpayments_ipn(db, payload)
+    except PaymentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return Response(
+        content=json.dumps(
+            {
+                "ok": True,
+                "reference": intent.provider_ref,
+                "status": intent.status,
+            }
+        ),
+        media_type="application/json",
+        status_code=200,
+    )
 
 
 @router.post("/deposits", response_model=PaymentIntentOut, status_code=201)
@@ -59,6 +94,8 @@ def initiate_deposit(
             channel=payload.channel,
             email=current_user.email,
             payer_phone=payload.phone or payload.payer_phone or current_user.phone,
+            network=payload.network,
+            provider=payload.provider,
         )
         out = _intent_out(intent)
         IdempotencyService.store(
@@ -78,7 +115,9 @@ def initiate_deposit(
             db, user_id=current_user.id, key=idempotency_key
         )
         db.commit()
-        raise HTTPException(status_code=400, detail=_payment_error_detail(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code, detail=_payment_error_detail(exc)
+        ) from exc
 
 
 @router.post("/withdrawals", response_model=PaymentIntentOut, status_code=201)
@@ -127,7 +166,9 @@ def initiate_withdrawal(
             db, user_id=current_user.id, key=idempotency_key
         )
         db.commit()
-        raise HTTPException(status_code=400, detail=_payment_error_detail(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code, detail=_payment_error_detail(exc)
+        ) from exc
     except Exception as exc:
         IdempotencyService.clear_in_progress(
             db, user_id=current_user.id, key=idempotency_key
@@ -155,7 +196,9 @@ def confirm_deposit_otp(
     except PaymentError as exc:
         if str(exc) == "not_found":
             raise HTTPException(status_code=404, detail="Payment not found") from exc
-        raise HTTPException(status_code=400, detail=_payment_error_detail(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code, detail=_payment_error_detail(exc)
+        ) from exc
     return _intent_out(intent)
 
 
@@ -178,7 +221,9 @@ def get_payment(
     except PaymentError as exc:
         if str(exc) == "not_found":
             raise HTTPException(status_code=404, detail="Payment not found") from exc
-        raise HTTPException(status_code=400, detail=_payment_error_detail(exc)) from exc
+        raise HTTPException(
+            status_code=exc.status_code, detail=_payment_error_detail(exc)
+        ) from exc
     return _intent_out(intent)
 
 

@@ -4,12 +4,30 @@ import os
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from urllib.parse import urlparse
+
 from app.core.db_url import (
     hosted_postgres_required,
     normalize_database_url,
     reject_sqlite_if_hosted,
     running_on_heroku,
 )
+
+
+def _private_callback(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    if parsed.scheme != "https" or not host or parsed.username or parsed.password:
+        return True
+    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.endswith(".local"):
+        return True
+    if host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
+        return True
+    if host.startswith("172."):
+        parts = host.split(".")
+        if len(parts) >= 2 and parts[1].isdigit() and 16 <= int(parts[1]) <= 31:
+            return True
+    return False
 
 
 class Settings(BaseSettings):
@@ -77,6 +95,24 @@ class Settings(BaseSettings):
         default="", validation_alias="MOOLRE_WEBHOOK_SECRET"
     )
     moolre_callback_url: str = Field(default="", validation_alias="MOOLRE_CALLBACK_URL")
+
+    nowpayments_enabled: bool = Field(
+        default=False, validation_alias="NOWPAYMENTS_ENABLED"
+    )
+    nowpayments_api_key: str = Field(default="", validation_alias="NOWPAYMENTS_API_KEY")
+    nowpayments_base_url: str = Field(
+        default="https://api.nowpayments.io",
+        validation_alias="NOWPAYMENTS_BASE_URL",
+    )
+    nowpayments_ipn_secret: str = Field(
+        default="", validation_alias="NOWPAYMENTS_IPN_SECRET"
+    )
+    nowpayments_ipn_callback_url: str = Field(
+        default="", validation_alias="NOWPAYMENTS_IPN_CALLBACK_URL"
+    )
+    nowpayments_price_currency: str = Field(
+        default="", validation_alias="NOWPAYMENTS_PRICE_CURRENCY"
+    )
 
     sportybet_facts_url: str = Field(
         default="https://www.sportybet.com/api/gh/factsCenter/importantEvents",
@@ -164,6 +200,31 @@ class Settings(BaseSettings):
             raise ValueError("PAYMENTS_MODE must be simulated, moolre, or disabled")
         return mode
 
+    @field_validator("nowpayments_base_url")
+    @classmethod
+    def normalize_nowpayments_base_url(cls, value: str) -> str:
+        raw = (value or "").strip().rstrip("/")
+        if not raw:
+            return "https://api.nowpayments.io"
+        allowed = {
+            "https://api.nowpayments.io",
+            "https://api.sandbox.nowpayments.io",
+        }
+        if raw not in allowed:
+            raise ValueError(
+                "NOWPAYMENTS_BASE_URL must be https://api.nowpayments.io or "
+                "https://api.sandbox.nowpayments.io"
+            )
+        return raw
+
+    @field_validator("nowpayments_price_currency")
+    @classmethod
+    def normalize_nowpayments_price_currency(cls, value: str) -> str:
+        raw = (value or "").strip().lower()
+        if raw and not raw.isalnum():
+            raise ValueError("NOWPAYMENTS_PRICE_CURRENCY must be a currency code")
+        return raw
+
     @field_validator("moolre_env")
     @classmethod
     def normalize_moolre_env(cls, value: str) -> str:
@@ -241,6 +302,10 @@ class Settings(BaseSettings):
     @property
     def cookie_secure(self) -> bool:
         return self.environment not in {"development", "test"}
+
+    def nowpayments_price_currency_code(self) -> str:
+        raw = (self.nowpayments_price_currency or "").strip().lower()
+        return raw or (self.payment_currency or "GHS").strip().lower()
 
     def moolre_request_base_url(self) -> str:
         configured = (self.moolre_api_base_url or "").strip().rstrip("/")
@@ -322,6 +387,26 @@ class Settings(BaseSettings):
                     + ", ".join(missing)
                 )
             self.moolre_request_base_url()
+        if self.nowpayments_enabled:
+            missing = [
+                name
+                for name, value in {
+                    "NOWPAYMENTS_API_KEY": self.nowpayments_api_key,
+                    "NOWPAYMENTS_IPN_SECRET": self.nowpayments_ipn_secret,
+                    "NOWPAYMENTS_IPN_CALLBACK_URL": self.nowpayments_ipn_callback_url,
+                }.items()
+                if not (value or "").strip()
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Missing required NOWPayments production configuration: "
+                    + ", ".join(missing)
+                )
+            callback = (self.nowpayments_ipn_callback_url or "").strip()
+            if not callback.lower().startswith("https://") or _private_callback(callback):
+                raise RuntimeError(
+                    "NOWPAYMENTS_IPN_CALLBACK_URL must be a public https URL"
+                )
 
 
 @lru_cache

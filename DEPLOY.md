@@ -69,6 +69,12 @@ heroku config:set PAYMENT_SECRET_KEY=sk_...
 heroku config:set PAYMENT_PUBLIC_KEY=pk_...
 heroku config:set PAYMENT_WEBHOOK_SECRET=...
 heroku config:set PAYMENT_CURRENCY=GHS
+heroku config:set NOWPAYMENTS_ENABLED=false
+heroku config:set NOWPAYMENTS_API_KEY=
+heroku config:set NOWPAYMENTS_BASE_URL=https://api.sandbox.nowpayments.io
+heroku config:set NOWPAYMENTS_IPN_SECRET=
+heroku config:set NOWPAYMENTS_IPN_CALLBACK_URL=https://api.yourdomain.com/api/v1/payments/webhooks/nowpayments
+heroku config:set NOWPAYMENTS_PRICE_CURRENCY=GHS
 ```
 
 Staging (simulated money only):

@@ -342,6 +342,8 @@ class PaymentInitiateIn(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     payer_phone: str | None = Field(default=None, max_length=32)
     destination: str | None = Field(default=None, max_length=255)
+    network: str | None = Field(default=None, max_length=32)
+    provider: str | None = Field(default=None, max_length=32)
 
 
 class PaymentOtpIn(BaseModel):
@@ -365,3 +367,12 @@ class PaymentIntentOut(BaseModel):
     next_action: str | None = None
     created_at: datetime | None = None
     completed_at: datetime | None = None
+    transaction_id: str | None = None
+    network: str | None = None
+    pay_address: str | None = None
+    pay_amount: str | None = None
+    pay_currency: str | None = None
+    payment_id: str | None = None
+    provider_status: str | None = None
+    expires_at: datetime | None = None
+    review_required: bool = False

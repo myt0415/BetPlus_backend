@@ -2,7 +2,8 @@ import hashlib
 import hmac
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +19,16 @@ from app.services.moolre_service import (
     is_tx_pending,
     is_tx_success,
 )
+from app.services.nowpayments_service import (
+    NowPaymentsError,
+    NowPaymentsService,
+    NowPaymentSnapshot,
+    PROVIDER_STATUS_RANK,
+    betplus_status_for,
+    looks_like_crypto,
+    parse_payment,
+    resolve_asset,
+)
 from app.services.wallet_service import InsufficientBalanceError, WalletService
 
 logger = logging.getLogger("app.payments")
@@ -29,9 +40,16 @@ PENDING_STATUSES = frozenset({"pending", "processing"})
 
 
 class PaymentError(Exception):
-    def __init__(self, message: str, *, reference: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reference: str | None = None,
+        status_code: int = 400,
+    ):
         super().__init__(message)
         self.reference = reference
+        self.status_code = status_code
 
 
 def _new_ref() -> str:
@@ -56,8 +74,18 @@ class PaymentService:
         channel: str | None = None,
         email: str | None = None,
         payer_phone: str | None = None,
+        network: str | None = None,
+        provider: str | None = None,
     ) -> PaymentIntent:
         del email
+        if PaymentService._requests_crypto(channel, network, provider):
+            return PaymentService.initiate_crypto_deposit(
+                db,
+                user_id=user_id,
+                amount=amount,
+                channel=channel,
+                network=network,
+            )
         settings = get_settings()
         if settings.payments_mode == "disabled":
             raise PaymentError("Payments are disabled")
@@ -705,6 +733,13 @@ class PaymentService:
             raise PaymentError("not_found")
         if _extra(intent).get("otp_required"):
             return intent
+        if intent.provider == "nowpayments" and intent.status in PENDING_STATUSES:
+            try:
+                intent = PaymentService.reconcile_nowpayments(db, intent)
+            except PaymentError:
+                db.rollback()
+                intent = PaymentService.get_by_ref(db, reference) or intent
+            return intent
         if (
             get_settings().payments_mode == "moolre"
             and intent.status in PENDING_STATUSES
@@ -714,4 +749,539 @@ class PaymentService:
             except PaymentError:
                 db.rollback()
                 intent = PaymentService.get_by_ref(db, reference) or intent
+        return intent
+
+    @staticmethod
+    def _requests_crypto(
+        channel: str | None, network: str | None, provider: str | None
+    ) -> bool:
+        prov = (provider or "").strip().lower()
+        if prov and prov not in {"moolre", "nowpayments"}:
+            raise PaymentError("Unsupported payment provider")
+        crypto = looks_like_crypto(channel, network)
+        if prov == "moolre" and crypto:
+            raise PaymentError("Mobile money cannot process a crypto deposit")
+        if prov == "nowpayments":
+            return True
+        return crypto
+
+    @staticmethod
+    def initiate_crypto_deposit(
+        db: Session,
+        *,
+        user_id: str,
+        amount: float,
+        channel: str | None,
+        network: str | None,
+    ) -> PaymentIntent:
+        settings = get_settings()
+        if settings.payments_mode == "disabled":
+            raise PaymentError("Payments are disabled")
+        try:
+            NowPaymentsService.assert_ready()
+            asset = resolve_asset(channel, network)
+        except NowPaymentsError as exc:
+            raise PaymentError(str(exc), status_code=exc.status_code) from exc
+
+        try:
+            raw_amount = Decimal(str(amount))
+        except Exception as exc:
+            raise PaymentError("Enter a valid amount") from exc
+        if raw_amount != raw_amount.quantize(Decimal("0.01")):
+            raise PaymentError("Amount must have at most 2 decimal places")
+        dec_amount = to_decimal(amount)
+        if dec_amount < Decimal("1.00"):
+            raise PaymentError("Minimum deposit is 1.00")
+        if dec_amount > Decimal("50000.00"):
+            raise PaymentError("Maximum deposit is 50000.00")
+
+        price_currency = settings.nowpayments_price_currency_code()
+        WalletService._lock_user(db, user_id)
+        existing = PaymentService._reusable_crypto_intent(
+            db,
+            user_id=user_id,
+            amount=dec_amount,
+            channel=asset.channel,
+            network=asset.network,
+        )
+        if existing:
+            db.commit()
+            db.refresh(existing)
+            return existing
+
+        intent = PaymentIntent(
+            user_id=user_id,
+            provider="nowpayments",
+            kind="deposit",
+            provider_ref=_new_ref(),
+            amount=dec_amount,
+            currency=settings.payment_currency,
+            status="pending",
+            channel=asset.channel,
+            network=asset.network,
+            pay_currency=asset.pay_currency,
+            price_currency=price_currency,
+            provider_status="waiting",
+        )
+        db.add(intent)
+        db.flush()
+
+        try:
+            estimated = NowPaymentsService.estimate(
+                dec_amount, price_currency, asset.pay_currency
+            )
+            min_crypto, min_fiat = NowPaymentsService.minimum_fiat(
+                asset.pay_currency, price_currency
+            )
+            if min_fiat is not None and dec_amount < min_fiat:
+                raise NowPaymentsError("Deposit is below the crypto provider minimum")
+            if min_crypto is not None and estimated < min_crypto and min_fiat is None:
+                raise NowPaymentsError("Deposit is below the crypto provider minimum")
+            snapshot = NowPaymentsService.create_payment(
+                price_amount=dec_amount,
+                price_currency=price_currency,
+                pay_currency=asset.pay_currency,
+                order_id=intent.id,
+                ipn_callback_url=settings.nowpayments_ipn_callback_url.strip(),
+            )
+        except NowPaymentsError as exc:
+            intent.status = "failed"
+            intent.completed_at = _now()
+            intent.provider_status = "failed" if exc.timeout else intent.provider_status
+            intent.extra = {
+                "error": str(exc),
+                "provider_timeout": exc.timeout,
+            }
+            db.add(intent)
+            db.commit()
+            raise PaymentError(
+                str(exc), reference=intent.provider_ref, status_code=exc.status_code
+            ) from exc
+
+        if snapshot.order_id and snapshot.order_id != intent.id:
+            intent.status = "failed"
+            intent.completed_at = _now()
+            intent.extra = {"error": "Provider order id mismatch"}
+            db.add(intent)
+            db.commit()
+            raise PaymentError(
+                "Crypto provider returned an unexpected order",
+                reference=intent.provider_ref,
+                status_code=502,
+            )
+        if (
+            snapshot.price_currency
+            and snapshot.price_currency != price_currency
+        ) or (
+            snapshot.price_amount is not None
+            and to_decimal(snapshot.price_amount) != dec_amount
+        ):
+            intent.status = "failed"
+            intent.completed_at = _now()
+            intent.extra = {"error": "Provider price mismatch", "reconciliation_required": True}
+            db.add(intent)
+            db.commit()
+            raise PaymentError(
+                "Crypto provider returned an unexpected amount",
+                reference=intent.provider_ref,
+            )
+        if snapshot.pay_currency and snapshot.pay_currency != asset.pay_currency:
+            intent.status = "failed"
+            intent.completed_at = _now()
+            intent.extra = {"error": "Provider currency mismatch"}
+            db.add(intent)
+            db.commit()
+            raise PaymentError(
+                "Crypto provider returned an unexpected currency",
+                reference=intent.provider_ref,
+            )
+
+        PaymentService._store_crypto_snapshot(intent, snapshot)
+        mapped = betplus_status_for(snapshot.payment_status) or "pending"
+        if mapped in {"failed", "expired"}:
+            intent.status = mapped
+            intent.completed_at = _now()
+        elif mapped == "processing":
+            intent.status = "processing"
+        else:
+            intent.status = "pending"
+        db.add(intent)
+        db.commit()
+        db.refresh(intent)
+        logger.info(
+            "payment.crypto_pending id=%s ref=%s currency=%s network=%s",
+            intent.id,
+            intent.provider_ref,
+            asset.currency,
+            asset.network,
+        )
+        return intent
+
+    @staticmethod
+    def _reusable_crypto_intent(
+        db: Session,
+        *,
+        user_id: str,
+        amount,
+        channel: str,
+        network: str,
+    ) -> PaymentIntent | None:
+        rows = (
+            db.query(PaymentIntent)
+            .filter(
+                PaymentIntent.user_id == user_id,
+                PaymentIntent.provider == "nowpayments",
+                PaymentIntent.kind == "deposit",
+                PaymentIntent.status.in_(tuple(PENDING_STATUSES)),
+                PaymentIntent.amount == amount,
+                PaymentIntent.channel == channel,
+                PaymentIntent.network == network,
+            )
+            .order_by(PaymentIntent.created_at.desc())
+            .all()
+        )
+        now = _now()
+        for intent in rows:
+            extra = _extra(intent)
+            if extra.get("reconciliation_required"):
+                continue
+            if not intent.provider_txn_id or not intent.pay_address:
+                raise PaymentError(
+                    "A crypto deposit is already being created",
+                    status_code=409,
+                    reference=intent.provider_ref,
+                )
+            expires = intent.expires_at
+            if expires is not None:
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if expires <= now:
+                    continue
+            else:
+                created = intent.created_at
+                if created is not None:
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    if created <= now - timedelta(hours=1):
+                        continue
+            return intent
+        return None
+
+    @staticmethod
+    def _store_crypto_snapshot(intent: PaymentIntent, snapshot: NowPaymentSnapshot) -> None:
+        intent.provider_txn_id = snapshot.payment_id[:64]
+        intent.provider_status = snapshot.payment_status[:32]
+        if snapshot.pay_address and not intent.pay_address:
+            intent.pay_address = snapshot.pay_address[:128]
+        if snapshot.pay_amount is not None and (
+            not intent.pay_amount or snapshot.payment_status == "finished"
+        ):
+            intent.pay_amount = format(snapshot.pay_amount, "f")[:64]
+        if snapshot.pay_currency and not intent.pay_currency:
+            intent.pay_currency = snapshot.pay_currency[:32]
+        if snapshot.price_currency and not intent.price_currency:
+            intent.price_currency = snapshot.price_currency[:16]
+        if snapshot.expires_at:
+            intent.expires_at = snapshot.expires_at
+        extra = _extra(intent)
+        extra.update(
+            {
+                "provider_payment_id": snapshot.payment_id,
+                "provider_status": snapshot.payment_status,
+                "provider_status_rank": PROVIDER_STATUS_RANK.get(
+                    snapshot.payment_status, 0
+                ),
+                "provider_currency": snapshot.pay_currency,
+                "provider_network": intent.network,
+                "provider_pay_address": snapshot.pay_address,
+                "provider_pay_amount": (
+                    format(snapshot.pay_amount, "f") if snapshot.pay_amount is not None else None
+                ),
+                "provider_price_amount": (
+                    format(snapshot.price_amount, "f")
+                    if snapshot.price_amount is not None
+                    else None
+                ),
+                "provider_price_currency": snapshot.price_currency,
+                "provider_created_at": snapshot.created_at,
+                "actually_paid": (
+                    format(snapshot.actually_paid, "f")
+                    if snapshot.actually_paid is not None
+                    else None
+                ),
+            }
+        )
+        extra.pop("error", None)
+        intent.extra = extra
+
+    @staticmethod
+    def reconcile_nowpayments(db: Session, intent: PaymentIntent) -> PaymentIntent:
+        if intent.provider != "nowpayments":
+            return intent
+        if intent.status in TERMINAL_STATUSES:
+            return intent
+        if not intent.provider_txn_id:
+            return intent
+        try:
+            snapshot = NowPaymentsService.get_payment(intent.provider_txn_id)
+        except NowPaymentsError as exc:
+            raise PaymentError(str(exc), status_code=exc.status_code) from exc
+        return PaymentService._apply_nowpayments_snapshot(db, intent, snapshot, commit=True)
+
+    @staticmethod
+    def handle_nowpayments_ipn(db: Session, payload: dict[str, Any]) -> PaymentIntent:
+        try:
+            snapshot = parse_payment(payload)
+        except NowPaymentsError as exc:
+            raise PaymentError("Invalid crypto callback") from exc
+
+        intent = PaymentService._find_nowpayments_intent(db, snapshot)
+        if intent.status in TERMINAL_STATUSES:
+            return intent
+        event_key = f"{snapshot.payment_id}:{snapshot.payment_status}"[:128]
+        claimed = PaymentService._claim_webhook_event(
+            db,
+            provider="nowpayments",
+            event_key=event_key,
+            intent_id=intent.id,
+        )
+        if not claimed:
+            logger.info(
+                "payment.crypto_webhook_duplicate id=%s status=%s",
+                intent.id,
+                snapshot.payment_status,
+            )
+            return intent
+        return PaymentService._apply_nowpayments_snapshot(
+            db, intent, snapshot, commit=True
+        )
+
+    @staticmethod
+    def _find_nowpayments_intent(db: Session, snapshot: NowPaymentSnapshot) -> PaymentIntent:
+        intent = None
+        if snapshot.order_id:
+            intent = (
+                db.query(PaymentIntent)
+                .filter(PaymentIntent.id == snapshot.order_id)
+                .with_for_update()
+                .first()
+            )
+        if intent is None:
+            intent = (
+                db.query(PaymentIntent)
+                .filter(
+                    PaymentIntent.provider == "nowpayments",
+                    PaymentIntent.provider_txn_id == snapshot.payment_id,
+                )
+                .with_for_update()
+                .first()
+            )
+        if not intent or intent.provider != "nowpayments":
+            raise PaymentError("Unknown payment reference")
+        if snapshot.order_id and snapshot.order_id != intent.id:
+            raise PaymentError("Payment reference mismatch")
+        if intent.provider_txn_id and intent.provider_txn_id != snapshot.payment_id:
+            raise PaymentError("Payment reference mismatch")
+        return intent
+
+    @staticmethod
+    def _apply_nowpayments_snapshot(
+        db: Session,
+        intent: PaymentIntent,
+        snapshot: NowPaymentSnapshot,
+        *,
+        commit: bool,
+    ) -> PaymentIntent:
+        locked = (
+            db.query(PaymentIntent)
+            .filter(PaymentIntent.id == intent.id)
+            .with_for_update()
+            .first()
+        )
+        if not locked:
+            raise PaymentError("Unknown payment reference")
+        if locked.status in TERMINAL_STATUSES:
+            return locked
+
+        extra = _extra(locked)
+        previous_rank = int(extra.get("provider_status_rank") or 0)
+        incoming_rank = PROVIDER_STATUS_RANK.get(snapshot.payment_status, 0)
+        if incoming_rank and previous_rank and incoming_rank < previous_rank:
+            logger.info(
+                "payment.crypto_status_replay id=%s status=%s",
+                locked.id,
+                snapshot.payment_status,
+            )
+            if commit:
+                db.commit()
+            return locked
+
+        if snapshot.pay_currency and locked.pay_currency and snapshot.pay_currency != locked.pay_currency:
+            return PaymentService._mark_crypto_review(
+                db,
+                locked,
+                reason="currency_mismatch",
+                snapshot=snapshot,
+                commit=commit,
+            )
+        if snapshot.order_id and snapshot.order_id != locked.id:
+            return PaymentService._mark_crypto_review(
+                db,
+                locked,
+                reason="order_mismatch",
+                snapshot=snapshot,
+                commit=commit,
+            )
+
+        PaymentService._store_crypto_snapshot(locked, snapshot)
+        mapped = betplus_status_for(snapshot.payment_status)
+        if mapped is None:
+            extra = _extra(locked)
+            extra["unknown_provider_status"] = snapshot.payment_status
+            locked.extra = extra
+            db.add(locked)
+            if commit:
+                db.commit()
+                db.refresh(locked)
+            return locked
+
+        if snapshot.payment_status == "partially_paid":
+            return PaymentService._mark_crypto_review(
+                db,
+                locked,
+                reason="partially_paid",
+                snapshot=snapshot,
+                commit=commit,
+            )
+        if mapped in {"failed", "expired"}:
+            return PaymentService._fail_intent(db, locked, status=mapped, commit=commit)
+        if mapped == "completed":
+            return PaymentService._credit_crypto_if_amounts_match(
+                db, locked, snapshot, commit=commit
+            )
+        if mapped == "processing" and locked.status == "pending":
+            locked.status = "processing"
+        db.add(locked)
+        if commit:
+            db.commit()
+            db.refresh(locked)
+        return locked
+
+    @staticmethod
+    def _credit_crypto_if_amounts_match(
+        db: Session,
+        intent: PaymentIntent,
+        snapshot: NowPaymentSnapshot,
+        *,
+        commit: bool,
+    ) -> PaymentIntent:
+        """Credit the wallet only for a finished payment whose fiat price matches."""
+        if snapshot.payment_status != "finished":
+            return intent
+        price_currency = (intent.price_currency or "").strip().lower()
+        wallet_currency = (intent.currency or "").strip().lower()
+        mismatch = None
+        if snapshot.price_currency != price_currency or price_currency != wallet_currency:
+            mismatch = "price_currency"
+        elif snapshot.price_amount is None or to_decimal(snapshot.price_amount) != to_decimal(
+            intent.amount
+        ):
+            mismatch = "price_amount"
+        elif not snapshot.pay_currency or snapshot.pay_currency != (intent.pay_currency or ""):
+            mismatch = "pay_currency"
+        elif snapshot.pay_amount is None or snapshot.actually_paid is None:
+            mismatch = "crypto_amount_missing"
+        elif snapshot.actually_paid < snapshot.pay_amount:
+            mismatch = "underpaid"
+        if mismatch:
+            return PaymentService._mark_crypto_review(
+                db, intent, reason=mismatch, snapshot=snapshot, commit=commit
+            )
+        return PaymentService._credit_crypto_deposit(
+            db, intent, provider_txn_id=snapshot.payment_id, commit=commit
+        )
+
+    @staticmethod
+    def _credit_crypto_deposit(
+        db: Session,
+        intent: PaymentIntent,
+        *,
+        provider_txn_id: str,
+        commit: bool,
+    ) -> PaymentIntent:
+        locked = (
+            db.query(PaymentIntent)
+            .filter(PaymentIntent.id == intent.id)
+            .with_for_update()
+            .first()
+        )
+        if not locked:
+            raise PaymentError("Payment not found")
+        if locked.status == "completed":
+            return locked
+        if locked.status in {"failed", "cancelled", "expired", "reversed"}:
+            return locked
+        if locked.status not in PENDING_STATUSES:
+            return locked
+
+        extra = _extra(locked)
+        extra["reconciliation_required"] = False
+        locked.extra = extra
+        locked.status = "processing"
+        db.flush()
+        WalletService.deposit(
+            db,
+            locked.user_id,
+            float(locked.amount),
+            f"Crypto deposit {locked.provider_ref}",
+            track_referral=True,
+            commit=False,
+        )
+        extra = _extra(locked)
+        extra["wallet_credited"] = True
+        extra["reconciliation_required"] = False
+        locked.extra = extra
+        locked.status = "completed"
+        locked.completed_at = _now()
+        locked.provider_status = "finished"
+        locked.provider_txn_id = str(provider_txn_id)[:64]
+        db.add(locked)
+        db.flush()
+        logger.info(
+            "payment.crypto_completed id=%s ref=%s",
+            locked.id,
+            locked.provider_ref,
+        )
+        if commit:
+            db.commit()
+            db.refresh(locked)
+        return locked
+
+    @staticmethod
+    def _mark_crypto_review(
+        db: Session,
+        intent: PaymentIntent,
+        *,
+        reason: str,
+        snapshot: NowPaymentSnapshot,
+        commit: bool,
+    ) -> PaymentIntent:
+        PaymentService._store_crypto_snapshot(intent, snapshot)
+        extra = _extra(intent)
+        extra["reconciliation_required"] = True
+        extra["reconciliation_reason"] = reason
+        intent.extra = extra
+        if intent.status == "pending":
+            intent.status = "processing"
+        db.add(intent)
+        db.flush()
+        logger.warning(
+            "payment.crypto_review id=%s reason=%s provider_status=%s",
+            intent.id,
+            reason,
+            snapshot.payment_status,
+        )
+        if commit:
+            db.commit()
+            db.refresh(intent)
         return intent

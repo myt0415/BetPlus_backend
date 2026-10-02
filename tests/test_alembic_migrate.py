@@ -60,4 +60,4 @@ def test_prefers_deeper_stampable_head():
 def test_real_scripts_have_one_stampable_head():
     script = ScriptDirectory.from_config(alembic_config())
     assert choose_upgrade_target(script) == "head"
-    assert script.get_heads() == ["007_webhook_events"]
+    assert script.get_heads() == ["008_nowpayments"]

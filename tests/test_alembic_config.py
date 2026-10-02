@@ -21,6 +21,7 @@ EXPECTED_REVISIONS = (
     "006_live_sync_job_idx",
     "006b_job_created_idx",
     "007_webhook_events",
+    "008_nowpayments",
 )
 
 
@@ -105,9 +106,13 @@ def test_alembic_upgrade_head_on_sqlite(tmp_path, monkeypatch):
     assert "external_game_id" in game_cols
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+    payment_cols = {col["name"] for col in inspect(engine).get_columns("payment_intents")}
     engine.dispose()
     reset_settings_cache()
-    assert version == "007_webhook_events"
+    assert version == "008_nowpayments"
+    assert "pay_address" in payment_cols
+    assert "provider_status" in payment_cols
+    assert "network" in payment_cols
 
 
 def test_alembic_has_single_expected_head():
@@ -115,7 +120,7 @@ def test_alembic_has_single_expected_head():
     cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
-    assert heads == ["007_webhook_events"]
+    assert heads == ["008_nowpayments"]
 
     revisions = list(script.walk_revisions())
     ids = [rev.revision for rev in reversed(revisions)]
