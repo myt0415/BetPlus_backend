@@ -12,6 +12,9 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.money import to_decimal
 from app.models.payment import PaymentIntent, PaymentWebhookEvent
+from app.services.blockchain_address_provider import BlockchainAddressProvider
+from app.services.blockchain_monitor import BlockchainMonitor
+from app.services.crypto_pricing_service import CryptoPricingService
 from app.services.moolre_service import (
     MoolreError,
     MoolreService,
@@ -79,7 +82,24 @@ class PaymentService:
     ) -> PaymentIntent:
         del email
         if PaymentService._requests_crypto(channel, network, provider):
-            return PaymentService.initiate_crypto_deposit(
+            normalized_provider = (provider or "").strip().lower()
+            if normalized_provider == "nowpayments":
+                return PaymentService.initiate_crypto_deposit(
+                    db,
+                    user_id=user_id,
+                    amount=amount,
+                    channel=channel,
+                    network=network,
+                )
+            if normalized_provider == "blockchain":
+                return PaymentService.initiate_blockchain_deposit(
+                    db,
+                    user_id=user_id,
+                    amount=amount,
+                    channel=channel,
+                    network=network,
+                )
+            return PaymentService.initiate_blockchain_deposit(
                 db,
                 user_id=user_id,
                 amount=amount,
@@ -740,6 +760,13 @@ class PaymentService:
                 db.rollback()
                 intent = PaymentService.get_by_ref(db, reference) or intent
             return intent
+        if intent.provider == "blockchain" and intent.status in PENDING_STATUSES:
+            try:
+                intent = PaymentService.reconcile_blockchain_deposit(db, intent)
+            except PaymentError:
+                db.rollback()
+                intent = PaymentService.get_by_ref(db, reference) or intent
+            return intent
         if (
             get_settings().payments_mode == "moolre"
             and intent.status in PENDING_STATUSES
@@ -756,14 +783,93 @@ class PaymentService:
         channel: str | None, network: str | None, provider: str | None
     ) -> bool:
         prov = (provider or "").strip().lower()
-        if prov and prov not in {"moolre", "nowpayments"}:
+        if prov and prov not in {"moolre", "nowpayments", "blockchain"}:
             raise PaymentError("Unsupported payment provider")
         crypto = looks_like_crypto(channel, network)
         if prov == "moolre" and crypto:
             raise PaymentError("Mobile money cannot process a crypto deposit")
         if prov == "nowpayments":
             return True
+        if prov == "blockchain":
+            return True
         return crypto
+
+    @staticmethod
+    def _resolve_crypto_asset(channel: str | None, network: str | None) -> tuple[str, str, str]:
+        token = (channel or "").strip().lower()
+        net = (network or "").strip().lower()
+        if token in {"btc", "bitcoin"}:
+            if net and net not in {"bitcoin", "btc"}:
+                raise PaymentError("Unsupported BTC network")
+            return "btc", "bitcoin", "BTC"
+        if token in {"usdt", "tether"}:
+            if not net:
+                raise PaymentError("USDT network is required. Use trc20 or erc20.")
+            if net not in {"trc20", "erc20"}:
+                raise PaymentError("Unsupported USDT network. Use trc20 or erc20.")
+            return "usdt", net, "USDT"
+        raise PaymentError("Unsupported crypto currency")
+
+    @staticmethod
+    def initiate_blockchain_deposit(
+        db: Session,
+        *,
+        user_id: str,
+        amount: float,
+        channel: str | None,
+        network: str | None,
+    ) -> PaymentIntent:
+        settings = get_settings()
+        if not settings.crypto_deposit_enabled:
+            raise PaymentError("Crypto deposits are temporarily unavailable.")
+
+        dec_amount = to_decimal(amount)
+        if dec_amount <= 0:
+            raise PaymentError("Amount must be positive")
+
+        currency, normalized_network, asset_name = PaymentService._resolve_crypto_asset(
+            channel, network
+        )
+        expected_crypto_amount = CryptoPricingService.calculate_expected_amount(
+            dec_amount,
+            crypto_currency=currency,
+            fiat_currency=settings.payment_currency,
+        )
+
+        reference = f"BETPLUS-DEP-{secrets.token_hex(4).upper()}"
+        provider = BlockchainAddressProvider()
+        address = provider.create_deposit_address(asset_name, normalized_network, reference)
+        expires_at = _now() + timedelta(minutes=max(1, settings.crypto_deposit_expiry_minutes))
+
+        intent = PaymentIntent(
+            user_id=user_id,
+            provider="blockchain",
+            kind="deposit",
+            provider_ref=reference,
+            amount=dec_amount,
+            currency=settings.payment_currency,
+            status="pending",
+            channel=currency,
+            network=normalized_network,
+            pay_currency=currency.upper(),
+            pay_amount=format(expected_crypto_amount, "f"),
+            pay_address=address,
+            price_currency=settings.payment_currency,
+            expires_at=expires_at,
+            provider_status="pending",
+            extra={
+                "deposit_reference": reference,
+                "asset_name": asset_name,
+                "expected_crypto_amount": format(expected_crypto_amount, "f"),
+                "pricing_rate_used": str(
+                    CryptoPricingService.get_rate(currency, settings.payment_currency)
+                ),
+            },
+        )
+        db.add(intent)
+        db.commit()
+        db.refresh(intent)
+        return intent
 
     @staticmethod
     def initiate_crypto_deposit(
@@ -916,6 +1022,15 @@ class PaymentService:
             asset.network,
         )
         return intent
+
+    @staticmethod
+    def reconcile_blockchain_deposit(db: Session, intent: PaymentIntent) -> PaymentIntent:
+        if intent.provider != "blockchain":
+            return intent
+        if intent.status in TERMINAL_STATUSES:
+            return intent
+        monitor = BlockchainMonitor()
+        return monitor.reconcile_reference(intent.provider_ref, db)
 
     @staticmethod
     def _reusable_crypto_intent(

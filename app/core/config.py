@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 import os
 
@@ -79,6 +80,38 @@ class Settings(BaseSettings):
         default="", validation_alias="PAYMENT_WEBHOOK_SECRET"
     )
     payment_currency: str = Field(default="GHS", validation_alias="PAYMENT_CURRENCY")
+    crypto_deposit_enabled: bool = Field(
+        default=True, validation_alias="CRYPTO_DEPOSITS_ENABLED"
+    )
+    crypto_deposit_expiry_minutes: int = Field(
+        default=60, validation_alias="CRYPTO_DEPOSIT_EXPIRY_MINUTES"
+    )
+    crypto_deposit_poll_interval_seconds: int = Field(
+        default=15, validation_alias="CRYPTO_DEPOSIT_POLL_INTERVAL"
+    )
+    btc_rpc_url: str = Field(default="", validation_alias="BTC_RPC_URL")
+    btc_indexer_url: str = Field(default="", validation_alias="BTC_INDEXER_URL")
+    tron_rpc_url: str = Field(default="", validation_alias="TRON_RPC_URL")
+    tron_indexer_url: str = Field(default="", validation_alias="TRON_INDEXER_URL")
+    eth_rpc_url: str = Field(default="", validation_alias="ETH_RPC_URL")
+    eth_indexer_url: str = Field(default="", validation_alias="ETH_INDEXER_URL")
+    usdt_trc20_contract: str = Field(default="", validation_alias="USDT_TRC20_CONTRACT")
+    usdt_erc20_contract: str = Field(default="", validation_alias="USDT_ERC20_CONTRACT")
+    crypto_btc_ghs_rate: Decimal = Field(
+        default=Decimal("22000"), validation_alias="CRYPTO_BTC_GHS_RATE"
+    )
+    crypto_usdt_ghs_rate: Decimal = Field(
+        default=Decimal("1"), validation_alias="CRYPTO_USDT_GHS_RATE"
+    )
+    btc_confirmations_required: int = Field(
+        default=2, validation_alias="BTC_CONFIRMATIONS_REQUIRED"
+    )
+    usdt_trc20_confirmations_required: int = Field(
+        default=6, validation_alias="USDT_TRC20_CONFIRMATIONS_REQUIRED"
+    )
+    usdt_erc20_confirmations_required: int = Field(
+        default=12, validation_alias="USDT_ERC20_CONFIRMATIONS_REQUIRED"
+    )
 
     moolre_env: str = Field(default="sandbox", validation_alias="MOOLRE_ENV")
     moolre_api_base_url: str = Field(
